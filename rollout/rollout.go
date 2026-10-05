@@ -1,6 +1,4 @@
 // Package rollout 把热更开关按百分比灰度给玩家，结果必须与并发度无关。
-// 缺陷：命中判定掺进了 worker 编号、版本不校验、结果按完成顺序返回而不是玩家名升序、
-// 汇总时对每个玩家重扫已有结果。
 package rollout
 
 import (
@@ -35,8 +33,12 @@ func New(version, workers int) *Rollout {
 	return &Rollout{version: version, workers: workers}
 }
 
-// Apply 按百分比把玩家分批命中，返回结果。缺陷：哈希掺了 worker 编号、不校验版本、结果未排序、汇总平方级。
+// Apply 按百分比把玩家分批命中，返回结果。版本回退返回 ErrStaleVersion 且不改状态；
+// 命中判定只看开关名与玩家名，命中名单按玩家名升序，与 workers 无关。
 func (r *Rollout) Apply(version int, flag string, percent int, players []string) (Result, error) {
+	if version < r.version {
+		return Result{}, ErrStaleVersion
+	}
 	type chunk struct {
 		index   int
 		players []string
@@ -60,8 +62,7 @@ func (r *Rollout) Apply(version int, flag string, percent int, players []string)
 			for _, player := range item.players {
 				hasher := fnv.New32a()
 				hasher.Write([]byte(flag + "|" + player))
-				hasher.Write([]byte{byte(item.index)})
-				if int(hasher.Sum32()%100) <= percent {
+				if int(hasher.Sum32()%100) < percent {
 					hit = append(hit, player)
 				}
 			}
@@ -69,13 +70,14 @@ func (r *Rollout) Apply(version int, flag string, percent int, players []string)
 		}(item)
 	}
 	wait.Wait()
-	result := Result{Version: r.version}
-	r.version = version
+	result := Result{Version: version}
 	for _, part := range out {
 		result.Hit = append(result.Hit, part...)
 	}
+	sort.Strings(result.Hit)
 	result.Miss = len(players) - len(result.Hit)
-	r.scanned += len(players) * len(result.Hit)
+	r.version = version
+	r.scanned += len(players)
 	return result, nil
 }
 
